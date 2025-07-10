@@ -1,100 +1,107 @@
+// server.js
 const express = require('express');
+const http = require('http');
+const path = require('path');
+const WebSocket = require('ws');
 const cors = require('cors');
 
-const app = express();
 const PORT = process.env.PORT || 3000;
+const app = express();
 
+// — Поддержка CORS и парсинг JSON (если вдруг понадобятся HTTP-роуты) —
 app.use(cors());
 app.use(express.json());
 
-// --- Управление состоянием на сервере ---
-// Это объект будет хранить все данные "комнаты"
+// — Отдача статических файлов (гифки, svg, avatar-placeholder и т.д.) —
+app.use(express.static(path.join(__dirname, 'public')));
+
+// — Создаём HTTP-сервер и «на его базе» WebSocket —
+const server = http.createServer(app);
+const wss = new WebSocket.Server({ server });
+
+// — Глобальное состояние «комнаты» —
 let state = {
-  scores: {
-    userA: 0,
-    userB: 0,
-  },
-  users: {
-    userA: null, // ID для первого пользователя
-    userB: null, // ID для второго пользователя
-  },
-  // Мы будем хранить последние несколько событий
-  history: []
+  scores: { userA: 0, userB: 0 },
+  users: { userA: null, userB: null },
+  history: []  // { actor: 'Pumpkin'|'Me', time: 'HH:MM' }
 };
 
-// --- API эндпоинты ---
+// — Утилита для рассылки всем клиентам —
+function broadcast(msg) {
+  const data = JSON.stringify(msg);
+  wss.clients.forEach(ws => {
+    if (ws.readyState === WebSocket.OPEN) {
+      ws.send(data);
+    }
+  });
+}
 
-// Эндпоинт для "входа" нового пользователя
-app.get('/join', (req, res) => {
-  // Создаем временный ID для сессии пользователя
-  const tempId = Date.now().toString() + Math.random().toString(); 
+wss.on('connection', ws => {
+  // При подключении сразу пришлём текущее состояние
+  ws.send(JSON.stringify({ type: 'update', payload: state }));
 
-  // Если место первого игрока свободно
-  if (state.users.userA === null) {
-    state.users.userA = tempId;
-    console.log('User A joined');
-    return res.json({ role: 'userA', state });
-  }
+  ws.on('message', raw => {
+    let msg;
+    try { msg = JSON.parse(raw); }
+    catch (e) { return; }
 
-  // Если место второго игрока свободно
-  if (state.users.userB === null) {
-    state.users.userB = tempId;
-    console.log('User B joined');
-    return res.json({ role: 'userB', state });
-  }
-  
-  // Если оба места заняты, пользователь будет зрителем
-  return res.json({ role: 'spectator', state });
+    switch (msg.type) {
+      case 'join': {
+        // Клиент просит роль
+        const tempId = Date.now().toString() + Math.random().toString();
+        let role;
+        if (!state.users.userA) {
+          state.users.userA = tempId;
+          role = 'userA';
+        } else if (!state.users.userB) {
+          state.users.userB = tempId;
+          role = 'userB';
+        } else {
+          role = 'spectator';
+        }
+        // Отдаём роль и текущее состояние
+        ws.send(JSON.stringify({ type: 'join', role, state }));
+        break;
+      }
+
+      case 'click': {
+        // msg: { type:'click', role:'userA'|'userB' }
+        if (msg.role === 'userA') {
+          state.scores.userA++;
+        } else if (msg.role === 'userB') {
+          state.scores.userB++;
+        } else {
+          return;
+        }
+        // Добавляем в историю
+        const now = new Date();
+        const hh = now.getHours().toString().padStart(2, '0');
+        const mm = now.getMinutes().toString().padStart(2, '0');
+        const actorName = msg.role === 'userA' ? 'Pumpkin' : 'Me';
+        state.history.unshift({ actor: actorName, time: `${hh}:${mm}` });
+        if (state.history.length > 10) state.history.pop();
+
+        // Рассылаем всем обновлённый state
+        broadcast({ type: 'update', payload: state });
+        break;
+      }
+
+      case 'reset': {
+        // Сброс состояния
+        state = {
+          scores: { userA: 0, userB: 0 },
+          users: { userA: null, userB: null },
+          history: []
+        };
+        // Сообщаем клиентам, что сброс выполнен
+        broadcast({ type: 'resetDone' });
+        break;
+      }
+    }
+  });
 });
 
-
-// Эндпоинт для получения текущего состояния
-app.get('/state', (req, res) => {
-  res.json(state);
-});
-
-// Эндпоинт для отправки "любви"
-app.post('/send-love', (req, res) => {
-  const { role } = req.body; // Ожидаем в теле запроса: { "role": "userA" } или { "role": "userB" }
-
-  let actorName = '';
-
-  if (role === 'userA') {
-    state.scores.userA += 1;
-    actorName = 'Pumpkin'; // Предположим, что userA это Pumpkin
-  } else if (role === 'userB') {
-    state.scores.userB += 1;
-    actorName = 'Me'; // А userB это "Я"
-  } else {
-    return res.status(400).json({ success: false, message: 'Invalid role provided.' });
-  }
-  
-  // Добавляем событие в историю
-  const now = new Date();
-  const timeString = now.getHours().toString().padStart(2, '0') + ':' + now.getMinutes().toString().padStart(2, '0');
-  state.history.unshift({ actor: actorName, time: timeString });
-  
-  // Ограничиваем историю до 10 последних событий
-  if (state.history.length > 10) {
-    state.history.pop();
-  }
-
-  console.log('New state:', state.scores);
-  res.json({ success: true, state });
-});
-
-// Эндпоинт для сброса состояния (удобно для тестирования)
-app.post('/reset', (req, res) => {
-    state = {
-      scores: { userA: 0, userB: 0 },
-      users: { userA: null, userB: null },
-      history: []
-    };
-    console.log('State has been reset.');
-    res.json({ success: true, message: 'State reset.' });
-});
-
-
-app.listen(PORT, () => {
-  console.log(`Server is running on port ${PORT}`);
+// Запуск
+server.listen(PORT, () => {
+  console.log(`Server running on port ${PORT}`);
 });
